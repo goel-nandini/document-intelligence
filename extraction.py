@@ -35,11 +35,10 @@ import time
 
 # Primary & Fallback Models for Google Gemini
 GEMINI_MODELS: list[str] = [
+    "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.5-flash",
     "gemini-3.7-flash",
-    "gemini-3.1-pro-preview",
-    "gemini-flash-latest",
 ]
 
 # Allowed document classification types
@@ -155,26 +154,51 @@ def _generate_with_gemini(
 
 
 def _clean_and_parse_json(text: str) -> dict[str, Any] | None:
-    """Strip code fences, whitespace, and parse JSON string into dict."""
+    """Robustly extract and parse JSON from LLM response text."""
+    if not text or not isinstance(text, str):
+        return None
+
     cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-        cleaned = cleaned.strip()
+
+    # 1. Strip markdown code fences if present (e.g. ```json ... ``` or ``` ...)
+    cleaned = re.sub(r"^```(?:json|JSON)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = cleaned.strip()
+
+    # 2. Safety net: extract only substring between first "{" and last "}"
+    first_brace = cleaned.find("{")
+    last_brace = cleaned.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        cleaned = cleaned[first_brace : last_brace + 1].strip()
 
     try:
         data = json.loads(cleaned)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
-        if match:
+        print(f"[DEBUG _clean_and_parse_json] Successfully parsed JSON. Type: {type(data)}")
+
+        # Safety net: check for double-encoding where json.loads returns a string
+        if isinstance(data, str):
             try:
-                data = json.loads(match.group(1))
-                if isinstance(data, dict):
-                    return data
+                data = json.loads(data)
+                print(f"[DEBUG _clean_and_parse_json] Decoded double-encoded JSON string. New type: {type(data)}")
             except Exception:
                 pass
+
+        if isinstance(data, dict):
+            # Check if inner 'fields' or 'tables' are double-encoded strings
+            if isinstance(data.get("fields"), str):
+                try:
+                    data["fields"] = json.loads(data["fields"])
+                except Exception:
+                    pass
+            if isinstance(data.get("tables"), str):
+                try:
+                    data["tables"] = json.loads(data["tables"])
+                except Exception:
+                    pass
+            return data
+    except Exception as e:
+        print(f"[DEBUG _clean_and_parse_json] JSON parse error: {e}")
+
     return None
 
 
@@ -325,8 +349,14 @@ def call_llm_for_extraction(
 
     try:
         content_text = _generate_with_gemini(prompt=prompt, client=client)
+        print("\n" + "=" * 60)
+        print("[DEBUG call_llm_for_extraction] RAW STRING RESPONSE FROM LLM BEFORE JSON PARSING:")
+        print(content_text)
+        print("=" * 60 + "\n")
+
         parsed = _clean_and_parse_json(content_text)
         if parsed is not None:
+            print(f"[DEBUG call_llm_for_extraction] Parsed Python object type: {type(parsed)} (dict check: {isinstance(parsed, dict)})")
             return parsed
 
         logger.warning("First Gemini JSON parse failed. Retrying with strict JSON instruction...")
@@ -338,8 +368,14 @@ def call_llm_for_extraction(
             "Respond with ONLY the valid raw JSON object, without markdown code fences or conversational text."
         )
         retry_text = _generate_with_gemini(prompt=retry_prompt, client=client)
+        print("\n" + "=" * 60)
+        print("[DEBUG call_llm_for_extraction] RAW STRING RESPONSE ON RETRY:")
+        print(retry_text)
+        print("=" * 60 + "\n")
+
         parsed_retry = _clean_and_parse_json(retry_text)
         if parsed_retry is not None:
+            print(f"[DEBUG call_llm_for_extraction] Retry parsed Python object type: {type(parsed_retry)} (dict check: {isinstance(parsed_retry, dict)})")
             return parsed_retry
 
         logger.error("Gemini extraction JSON parsing failed after retry.")
@@ -592,6 +628,19 @@ def extract_fields(
             "bbox": table_bbox,
             "rows": formatted_rows,
         })
+
+    # Double-encoding / Type safety verification
+    assert isinstance(extracted_fields, dict), f"extracted_fields must be dict, got {type(extracted_fields)}"
+    assert isinstance(tables_output, list), f"tables must be list, got {type(tables_output)}"
+
+    print("\n" + "=" * 60)
+    print(f"[DEBUG extract_fields] FINAL EXTRACTED FIELDS (Type: {type(extracted_fields)}, Count: {len(extracted_fields)}):")
+    for fn, fv in extracted_fields.items():
+        print(f"  - {fn}: val={repr(fv.get('value'))} (val_type: {type(fv.get('value')).__name__}), raw_ocr={repr(fv.get('raw_ocr_text'))}, bbox={fv.get('bbox')}")
+    print(f"[DEBUG extract_fields] FINAL TABLES (Type: {type(tables_output)}, Count: {len(tables_output)}):")
+    for tbl in tables_output:
+        print(f"  - Table: {tbl.get('table_name')}, rows: {len(tbl.get('rows', []))}")
+    print("=" * 60 + "\n")
 
     return {
         "doc_type": doc_type,

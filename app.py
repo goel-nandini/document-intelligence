@@ -16,10 +16,12 @@ import streamlit as st
 from dotenv import load_dotenv
 
 import authenticity_check
+import confidence
 import db
 import extraction
 import ocr
 import preprocessing
+import validation
 
 load_dotenv()
 
@@ -84,7 +86,7 @@ st.markdown(
 
 # Sidebar with system controls & API configuration
 with st.sidebar:
-    st.markdown('<span class="phase-badge">Phases 1 - 4 Active</span>', unsafe_allow_html=True)
+    st.markdown('<span class="phase-badge">Phases 1 - 6 Active</span>', unsafe_allow_html=True)
     st.title("System Controls")
 
     # Google Gemini API Key
@@ -100,7 +102,7 @@ with st.sidebar:
             "Gemini API Key",
             value=gemini_key_env,
             type="password",
-            help="Used for Phase 4 field extraction via Google Gemini.",
+            help="Used for Phase 4 extraction & Phase 5 confidence evaluation via Google Gemini.",
         )
         if gemini_input:
             os.environ["GEMINI_API_KEY"] = gemini_input.strip()
@@ -112,24 +114,29 @@ with st.sidebar:
         - **Phase 3:** Exact Hash & pHash Deduplication (Hamming dist <= 5), Timeline Inconsistency, Suspicious Software Checks, Error Level Analysis (ELA).
         - **Phase 2:** Tesseract OCR, Line Grouping, Spatial Bounding Boxes, Confidence Calibration.
         - **Phase 4:** Google Gemini Document Classification, Schema-Driven Field Extraction, Table Extraction & Spatial Bbox Grounding.
+        - **Phase 5:** Multi-Factor Confidence Scoring (Spatial OCR Overlap, LLM Self-Reported Certainty, Format Rules).
+        - **Phase 6:** Validation Layer (Cross-Checks, Font-Consistency Tamper Detection & Confidentiality Classification).
         """
     )
     st.divider()
     st.markdown(f"**Blur Threshold:** `{preprocessing.BLUR_THRESHOLD}`")
     st.markdown(f"**Low Confidence OCR Cutoff:** `{ocr.LOW_CONFIDENCE_THRESHOLD * 100:.0f}%`")
     st.markdown(f"**Metadata Time Gap Threshold:** `{authenticity_check.METADATA_TIME_GAP_THRESHOLD_DAYS} day(s)`")
+    st.markdown(f"**Confidence Green Cutoff:** `≥ {confidence.CONFIDENCE_GREEN_THRESHOLD:.2f}`")
+    st.markdown(f"**Confidence Amber Cutoff:** `≥ {confidence.CONFIDENCE_AMBER_THRESHOLD:.2f}`")
+    st.markdown(f"**Font Deviation Cutoff:** `> {validation.FONT_DEVIATION_THRESHOLD:.1f} std dev`")
     st.divider()
     if ocr.TESSERACT_AVAILABLE:
         st.success("Tesseract OCR: Online")
     else:
         st.error("Tesseract OCR: Offline (Check PATH or tesseract_cmd)")
-    st.caption("Document Intelligence Engine v4.0")
+    st.caption("Document Intelligence Engine v6.0")
 
 # Header Section
 st.markdown('<span class="phase-badge">Document Trust & Extraction Layer</span>', unsafe_allow_html=True)
 st.markdown('<div class="main-header">Document Intelligence System</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-header">Automated ingestion, deduplication, authenticity pre-check, OCR layout, and schema-driven field extraction.</div>',
+    '<div class="sub-header">Automated ingestion, deduplication, authenticity check, OCR layout, schema extraction, confidence scoring, and validation layer.</div>',
     unsafe_allow_html=True,
 )
 
@@ -256,19 +263,14 @@ if uploaded_file is not None:
                 f"Showing cached result instantly from matched document `{matched_id}`."
             )
 
-            # Phase 3 Validation schema block for duplicate
-            validation_schema = {
-                "validation": {
-                    "duplication_check": {
-                        "is_duplicate": True,
-                        "matched_document_id": matched_id,
-                        "match_type": match_type,
-                    },
-                    "tamper_flags": [],
-                }
-            }
-
-            st.json(validation_schema)
+            # Phase 3 Validation summary for duplicate
+            with st.expander("🛡️ Duplicate Verification Details", expanded=False):
+                dup_df = pd.DataFrame([
+                    {"Property": "Duplication Status", "Value": "Duplicate Found"},
+                    {"Property": "Matched Document ID", "Value": str(matched_id)},
+                    {"Property": "Match Method", "Value": str(match_type)},
+                ])
+                st.dataframe(dup_df, use_container_width=True, hide_index=True)
 
             # Fetch and display cached pipeline result if available
             cached_result = db.get_cached_result(matched_id)
@@ -279,18 +281,27 @@ if uploaded_file is not None:
                         f'<div class="doc-type-pill">CACHED DOC TYPE: {cached_result["doc_type"].upper()}</div>',
                         unsafe_allow_html=True,
                     )
-                with st.expander("📄 Full Cached Result JSON", expanded=True):
-                    st.json(cached_result)
 
                 # Show cached fields if present
                 if "extracted_fields" in cached_result:
                     st.markdown("**Cached Extracted Fields:**")
                     field_rows = [
-                        {"Field Name": k, "Extracted Value": v.get("value"), "Raw OCR Text": v.get("raw_ocr_text")}
+                        {
+                            "Field Name": k.replace("_", " ").title(),
+                            "Extracted Value": v.get("value") if isinstance(v, dict) else v,
+                            "Raw OCR Text": v.get("raw_ocr_text") if isinstance(v, dict) else "",
+                        }
                         for k, v in cached_result["extracted_fields"].items()
                     ]
                     if field_rows:
-                        st.dataframe(pd.DataFrame(field_rows), use_container_width=True)
+                        st.dataframe(pd.DataFrame(field_rows), use_container_width=True, hide_index=True)
+
+                with st.expander("📊 Normalized Cached Record Data", expanded=False):
+                    try:
+                        norm_df = pd.json_normalize(cached_result)
+                        st.dataframe(norm_df, use_container_width=True, hide_index=True)
+                    except Exception:
+                        pass
             else:
                 st.info(
                     f"A record for document `{matched_id}` is registered in the database. "
@@ -349,8 +360,12 @@ if uploaded_file is not None:
             result_json=None,
         )
 
-        with st.expander("📄 Phase 3 Validation Schema Contract", expanded=False):
-            st.json(validation_schema)
+        with st.expander("🛡️ Phase 3 Validation Audit Record", expanded=False):
+            val_rows = [
+                {"Audit Check": "Duplication Detected", "Result": "False (Original Document)"},
+                {"Audit Check": "Tamper Anomaly Flags Count", "Result": str(len(tamper_flags))},
+            ]
+            st.dataframe(pd.DataFrame(val_rows), use_container_width=True, hide_index=True)
 
         # =============================================================
         # Phase 2: OCR + Layout Extraction
@@ -441,10 +456,10 @@ if uploaded_file is not None:
                 st.divider()
 
         # =============================================================
-        # Phase 4: Schema-Driven Field & Table Extraction
+        # Phase 4 & 5: Schema Extraction & Per-Field Confidence Scoring
         # =============================================================
         st.divider()
-        st.subheader("🧠 Phase 4: Schema-Driven Field & Table Extraction")
+        st.subheader("🧠 Phase 4 & 5: Schema Extraction & Confidence Analysis")
 
         # Execute extraction pipeline with clear error handling for Gemini
         try:
@@ -458,82 +473,87 @@ if uploaded_file is not None:
             )
             st.stop()
 
-        detected_doc_type = extraction_result["doc_type"]
+        # Part A.3: Type verification and assertions
+        if not isinstance(extraction_result, dict):
+            raise TypeError(
+                f"Critical error: extraction_result must be a Python dict, but received {type(extraction_result).__name__}: {extraction_result}"
+            )
+
+        detected_doc_type = extraction_result.get("doc_type", "other")
         extracted_fields = extraction_result.get("extracted_fields", {})
         extracted_tables = extraction_result.get("tables", [])
         skipped_fields = extraction_result.get("_skipped_fields", [])
         unmapped_bbox_fields = extraction_result.get("_unmapped_bbox_fields", [])
 
-        # 1. Prominent Document Type Display
-        st.markdown(
-            f'<div class="doc-type-pill">DOCUMENT CLASSIFICATION: {detected_doc_type.upper()}</div>',
-            unsafe_allow_html=True,
+        if not isinstance(extracted_fields, dict):
+            raise TypeError(
+                f"Critical error: extracted_fields must be a Python dict, but received {type(extracted_fields).__name__}: {extracted_fields}"
+            )
+        if not isinstance(extracted_tables, list):
+            raise TypeError(
+                f"Critical error: tables must be a Python list, but received {type(extracted_tables).__name__}: {extracted_tables}"
+            )
+
+        # Build full text for Phase 5 LLM confidence scoring
+        ocr_full_text = "\n\n".join(
+            f"--- Page {p.get('page_number', i + 1)} ---\n{p.get('full_text', '')}"
+            for i, p in enumerate(pages_ocr)
         )
 
-        # 2. Warnings for omitted / unfound fields
-        if skipped_fields:
-            st.warning(
-                f"⚠️ **Omitted / Unfound Fields:** The following fields from the `{detected_doc_type}` schema "
-                f"were not found in the document text (LLM returned null and they were excluded): "
-                f"{', '.join(f'`{f}`' for f in skipped_fields)}"
+        # Phase 5: Multi-factor confidence scoring
+        with st.spinner("Phase 5: Calculating spatial OCR, LLM certainty, and rule-based confidence scores..."):
+            extracted_fields, extracted_tables = confidence.score_all_fields(
+                extracted_fields=extracted_fields,
+                tables=extracted_tables,
+                ocr_results=ocr_results,
+                doc_type=detected_doc_type,
+                ocr_full_text=ocr_full_text,
             )
 
-        # 3. Warnings for fields without spatial bounding box
-        if unmapped_bbox_fields:
-            st.warning(
-                f"⚠️ **Spatial Grounding Warning:** Bounding boxes could not be located in OCR text for: "
-                f"{', '.join(f'`{f}`' for f in unmapped_bbox_fields)} (values exist but lack source region coordinates)."
+        # Double check types after confidence scoring
+        assert isinstance(extracted_fields, dict), f"scored extracted_fields must be dict, got {type(extracted_fields)}"
+        assert isinstance(extracted_tables, list), f"scored tables must be list, got {type(extracted_tables)}"
+
+        # Part A.4: Print final extracted_fields and tables structure to console
+        print("\n" + "=" * 60)
+        print(f"[DEBUG Phase 5] FINAL SCORED EXTRACTED FIELDS (Type: {type(extracted_fields)}, Count: {len(extracted_fields)}):")
+        for fn, finfo in extracted_fields.items():
+            c = finfo.get("confidence", {})
+            print(f"  - {fn}: val={repr(finfo.get('value'))} (val_type: {type(finfo.get('value')).__name__}), bucket={c.get('bucket')}, score={c.get('combined_score')}, ocr={c.get('ocr_confidence')}, llm={c.get('llm_confidence')}, rule={c.get('rule_check_passed')}")
+        print(f"[DEBUG Phase 5] FINAL SCORED TABLES (Type: {type(extracted_tables)}, Count: {len(extracted_tables)}):")
+        for tbl in extracted_tables:
+            print(f"  - Table: {tbl.get('table_name')}, confidence={tbl.get('table_confidence')}, rows={len(tbl.get('rows', []))}")
+        print("=" * 60 + "\n")
+
+        # =============================================================
+        # Phase 6: Validation Layer (Cross-Checks, Font Consistency & Confidentiality)
+        # =============================================================
+        with st.spinner("Phase 6: Running business cross-checks, font-tamper consistency & confidentiality classification..."):
+            validation_output = validation.run_validation_pipeline(
+                doc_type=detected_doc_type,
+                extracted_fields=extracted_fields,
+                tables=extracted_tables,
+                ocr_results=ocr_results,
+                corrected_image=corrected_images[0],
+                existing_tamper_flags=tamper_flags,
             )
 
-        # 4. Render Extracted Fields Table
-        st.markdown("#### 📌 Extracted Key-Value Fields")
-        if extracted_fields:
-            field_table_data = []
-            for fname, finfo in extracted_fields.items():
-                bbox = finfo.get("bbox")
-                if bbox:
-                    bbox_str = f"Page {bbox.get('page', 1)} [{bbox.get('x')}, {bbox.get('y')}, {bbox.get('width')}x{bbox.get('height')}]"
-                else:
-                    bbox_str = "⚠️ Not Located"
+        cross_checks = validation_output.get("cross_checks", [])
+        all_tamper_flags = validation_output.get("tamper_flags", [])
+        confidentiality = validation_output.get("confidentiality", {})
 
-                field_table_data.append({
-                    "Field Name": fname,
-                    "Extracted Value": finfo.get("value"),
-                    "Raw OCR Text": finfo.get("raw_ocr_text"),
-                    "Field Type": finfo.get("field_type"),
-                    "Source Bounding Box": bbox_str,
-                })
-            st.dataframe(pd.DataFrame(field_table_data), use_container_width=True)
-        else:
-            st.info("No key-value fields were extracted from this document.")
-
-        # 5. Render Tables (e.g. line_items, deductions, transactions)
-        if extracted_tables:
-            st.markdown("#### 📊 Extracted Tables")
-            for t in extracted_tables:
-                t_name = t.get("table_name", "table")
-                rows = t.get("rows", [])
-                st.markdown(f"**Table: `{t_name}`** ({len(rows)} rows)")
-
-                if rows:
-                    flattened_rows = []
-                    for r in rows:
-                        row_dict = {"Row #": r.get("row_index")}
-                        cells = r.get("cells", {})
-                        for col_name, c_data in cells.items():
-                            row_dict[col_name] = c_data.get("value")
-                        flattened_rows.append(row_dict)
-                    st.dataframe(pd.DataFrame(flattened_rows), use_container_width=True)
-                else:
-                    st.caption("Table structure was detected but contains no data rows.")
-
-        # 6. Update SQLite Cache with Complete Pipeline Results
+        # Update SQLite Cache with Complete Pipeline Results (Phase 6 internal JSON storage)
         complete_pipeline_result = {
             "document_id": doc_id,
             "upload_timestamp": upload_ts,
             "file_metadata": metadata,
             "quality_assessment": quality,
-            "validation": validation_schema["validation"],
+            "validation": {
+                "duplication_check": validation_schema["validation"]["duplication_check"],
+                "cross_checks": cross_checks,
+                "tamper_flags": all_tamper_flags,
+            },
+            "confidentiality": confidentiality,
             "ocr_results": ocr_results,
             "doc_type": detected_doc_type,
             "extracted_fields": extracted_fields,
@@ -548,24 +568,266 @@ if uploaded_file is not None:
             doc_type=detected_doc_type,
         )
 
-        # 7. Phase 4 Output JSON Block
-        st.subheader("📑 Phase 4 Schema Output")
-        phase4_schema = {
-            "doc_type": detected_doc_type,
-            "extracted_fields": extracted_fields,
-            "tables": extracted_tables,
-        }
-        with st.expander("📄 Phase 4 Extracted Fields & Tables JSON Contract", expanded=True):
-            st.json(phase4_schema)
-            st.download_button(
-                label="📥 Download Phase 4 JSON",
-                data=json.dumps(phase4_schema, indent=2),
-                file_name=f"document_{doc_id[:8]}_phase4_fields.json",
-                mime="application/json",
+        # -------------------------------------------------------------
+        # UI DISPLAY: TABULAR AND POINTER-BASED ONLY (NO RAW JSON)
+        # -------------------------------------------------------------
+        # 1. Prominent Document Type Display
+        st.markdown(
+            f'<div class="doc-type-pill">DOCUMENT CLASSIFICATION: {detected_doc_type.upper()}</div>',
+            unsafe_allow_html=True,
+        )
+
+        # 2. Warnings for omitted / unfound fields & unmapped bounding boxes
+        if skipped_fields:
+            st.warning(
+                f"⚠️ **Omitted / Unfound Fields:** The following fields from the `{detected_doc_type}` schema "
+                f"were not found in the document text: {', '.join(f'`{f}`' for f in skipped_fields)}"
             )
 
-        with st.expander("📄 Cumulative Complete Pipeline JSON (Phases 1-4)", expanded=False):
-            st.json(complete_pipeline_result)
+        if unmapped_bbox_fields:
+            st.warning(
+                f"⚠️ **Spatial Grounding Warning:** Bounding boxes could not be located in OCR text for: "
+                f"{', '.join(f'`{f}`' for f in unmapped_bbox_fields)}"
+            )
+
+        # 3. Summary Metric Row
+        bucket_emoji_map = {"green": "🟢", "amber": "🟡", "red": "🔴"}
+        total_fields = len(extracted_fields)
+        green_count = sum(1 for f in extracted_fields.values() if f.get("confidence", {}).get("bucket") == "green")
+        amber_count = sum(1 for f in extracted_fields.values() if f.get("confidence", {}).get("bucket") == "amber")
+        red_count = sum(1 for f in extracted_fields.values() if f.get("confidence", {}).get("bucket") == "red")
+
+        st.markdown("#### 🎯 Confidence Summary")
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        with m_col1:
+            st.metric("Total Fields Extracted", total_fields)
+        with m_col2:
+            st.metric("🟢 Green Count", green_count)
+        with m_col3:
+            st.metric("🟡 Amber Count", amber_count)
+        with m_col4:
+            st.metric("🔴 Red Count", red_count)
+
+        # 4. "Key Details at a Glance" (Programmatically generated bullet points)
+        st.markdown("---")
+        st.markdown("### 🔍 Key Details at a Glance")
+        formatted_doc_type = detected_doc_type.replace("_", " ").title()
+        glance_lines = [f"**Document Type:** {formatted_doc_type}\n", "**Key Fields:**"]
+
+        for fname, finfo in extracted_fields.items():
+            flabel = fname.replace("_", " ").title()
+            fval = finfo.get("value", "")
+            fbucket = finfo.get("confidence", {}).get("bucket", "red")
+            emoji = bucket_emoji_map.get(fbucket, "🔴")
+            glance_lines.append(f"- **{flabel}:** {fval} {emoji}")
+
+        if len(glance_lines) > 2:
+            st.markdown("\n".join(glance_lines))
+        else:
+            st.markdown(f"**Document Type:** {formatted_doc_type}\n\n- *No key fields extracted.*")
+
+        st.markdown("---")
+
+        # 5. Clean st.dataframe with EXACTLY these columns:
+        # Field Name | Value | Confidence | Score
+        # Sorted so 🔴 red appears first, then 🟡 amber, then 🟢 green
+        st.markdown("### 📋 Field Extraction & Confidence Table")
+        priority_map = {"red": 0, "amber": 1, "green": 2}
+        field_rows = []
+
+        for fname, finfo in extracted_fields.items():
+            flabel = fname.replace("_", " ").title()
+            fval = finfo.get("value")
+            conf_obj = finfo.get("confidence", {})
+            bucket = conf_obj.get("bucket", "red")
+            score = conf_obj.get("combined_score", 0.0)
+            emoji = bucket_emoji_map.get(bucket, "🔴")
+
+            field_rows.append({
+                "Field Name": flabel,
+                "Value": str(fval) if fval is not None else "",
+                "Confidence": emoji,
+                "Score": f"{score:.2f}",
+                "_priority": priority_map.get(bucket, 3),
+                "_score": score,
+            })
+
+        # Sort: red first (0), amber second (1), green third (2); within bucket, lowest score first
+        field_rows.sort(key=lambda r: (r["_priority"], r["_score"]))
+
+        # Drop temporary sort keys to ensure EXACT column match: Field Name | Value | Confidence | Score
+        display_field_rows = [
+            {
+                "Field Name": r["Field Name"],
+                "Value": r["Value"],
+                "Confidence": r["Confidence"],
+                "Score": r["Score"],
+            }
+            for r in field_rows
+        ]
+
+        if display_field_rows:
+            st.dataframe(pd.DataFrame(display_field_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No key-value fields were extracted from this document.")
+
+        # 6. Extracted Tables (ONLY rendered as st.dataframe with actual columns + Confidence column)
+        if extracted_tables:
+            st.markdown("### 📊 Extracted Tables")
+            for tbl in extracted_tables:
+                t_name = tbl.get("table_name", "table")
+                t_title = t_name.replace("_", " ").title()
+                t_conf = tbl.get("table_confidence", 0.0)
+                t_emoji = "🟢" if t_conf >= 0.75 else ("🟡" if t_conf >= 0.40 else "🔴")
+                st.caption(f"**{t_title} — Table Confidence: {t_emoji} {t_conf:.2f}**")
+
+                rows = tbl.get("rows", [])
+                if rows:
+                    tbl_rows_data = []
+                    for r in rows:
+                        row_dict = {}
+                        cells = r.get("cells", {})
+                        cell_confs = []
+                        for col_name, cdata in cells.items():
+                            c_val = cdata.get("value") if isinstance(cdata, dict) else cdata
+                            c_conf = cdata.get("confidence", 0.0) if isinstance(cdata, dict) else 0.0
+                            col_title = col_name.replace("_", " ").title()
+                            row_dict[col_title] = str(c_val) if c_val is not None else ""
+                            cell_confs.append(c_conf)
+
+                        avg_row_conf = sum(cell_confs) / len(cell_confs) if cell_confs else 0.0
+                        row_emoji = "🟢" if avg_row_conf >= 0.75 else ("🟡" if avg_row_conf >= 0.40 else "🔴")
+                        row_dict["Confidence"] = row_emoji
+                        tbl_rows_data.append(row_dict)
+
+                    df_tbl = pd.DataFrame(tbl_rows_data)
+                    st.dataframe(df_tbl, use_container_width=True, hide_index=True)
+                else:
+                    st.caption(f"Table '{t_title}' was detected but contains no data rows.")
+
+        # =============================================================
+        # Phase 6: Validation Layer UI (Cross-Checks, Tamper Alerts, Confidentiality)
+        # =============================================================
+        st.markdown("---")
+        st.subheader("🛡️ Phase 6: Validation & Authenticity Layer")
+
+        # 1. Validation Summary Metric Row
+        total_cc = len(cross_checks)
+        passed_cc = sum(1 for c in cross_checks if c.get("passed", False))
+        cc_metric_val = f"{passed_cc}/{total_cc}" if total_cc > 0 else "N/A"
+
+        tamper_flags_count = len(all_tamper_flags)
+
+        is_confidential = confidentiality.get("is_confidential", False)
+        sensitivity_level = confidentiality.get("sensitivity_level", "none").upper()
+        if is_confidential:
+            conf_metric_val = f"🔒 {sensitivity_level}"
+        else:
+            conf_metric_val = "🔓 UNRESTRICTED"
+
+        val_col1, val_col2, val_col3 = st.columns(3)
+        with val_col1:
+            st.metric("Cross-Checks Passed", cc_metric_val)
+        with val_col2:
+            st.metric("Tamper Anomaly Flags", tamper_flags_count)
+        with val_col3:
+            st.metric("Confidentiality Status", conf_metric_val)
+
+        # 2. Business Logic Cross-Checks Table
+        st.markdown("#### ⚖️ Business Logic Cross-Checks")
+        if cross_checks:
+            # Sort failed checks first
+            sorted_checks = sorted(cross_checks, key=lambda c: 0 if not c.get("passed", False) else 1)
+            cc_table_rows = []
+            for c in sorted_checks:
+                passed = c.get("passed", False)
+                result_str = "✅ Passed" if passed else "❌ Failed"
+                fields_cmp = ", ".join(f"`{f}`" for f in c.get("fields_compared", []))
+                detail = c.get("discrepancy_detail") or c.get("expected_relationship", "OK")
+
+                cc_table_rows.append({
+                    "Check Name": c.get("check_name", "").replace("_", " ").title(),
+                    "Fields Compared": ", ".join(c.get("fields_compared", [])),
+                    "Result": result_str,
+                    "Detail": detail,
+                })
+            st.dataframe(pd.DataFrame(cc_table_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info(f"No specific business cross-checks configured for '{detected_doc_type}' documents.")
+
+        # 3. Tamper Flags Prominent Warning/Alert Boxes (Immediately visible, never hidden)
+        st.markdown("#### 🚩 Tamper & Authenticity Alerts")
+        if all_tamper_flags:
+            for flag in all_tamper_flags:
+                f_type = flag.get("flag_type", "tamper_flag").replace("_", " ").upper()
+                f_field = flag.get("affected_field")
+                f_target = f"Field: `{f_field}`" if f_field else "Whole Document"
+                f_sev = flag.get("severity", "medium").upper()
+                f_evidence = flag.get("evidence", "")
+
+                alert_text = (
+                    f"**[{f_type}] — {f_sev} Severity** | **Target:** {f_target}\n\n"
+                    f"{f_evidence}"
+                )
+                if f_sev == "HIGH":
+                    st.error(f"🚨 {alert_text}")
+                elif f_sev == "MEDIUM":
+                    st.warning(f"⚠️ {alert_text}")
+                else:
+                    st.info(f"ℹ️ {alert_text}")
+        else:
+            st.success(
+                "✅ **Authenticity Verification Passed:** No metadata inconsistencies, "
+                "recompression artifacts, or font irregularities detected across the document."
+            )
+
+        # 4. Confidentiality & PII Classification Highlight
+        st.markdown("#### 🔒 Confidentiality & PII Classification")
+        if is_confidential:
+            masked_fields = confidentiality.get("masked_field_names", [])
+            masked_badges = ", ".join(f"`{f}`" for f in masked_fields) if masked_fields else "None"
+            reason = confidentiality.get("classification_reason", "")
+
+            st.info(
+                f"🔒 **This document contains sensitive information ({sensitivity_level} SENSITIVITY).**\n\n"
+                f"**Classification Reason:** {reason}\n\n"
+                f"**Default Masked Fields:** {masked_badges}"
+            )
+        else:
+            st.success(
+                "🔓 **Standard Unrestricted Document:** No sensitive personally identifiable information (PII) "
+                "or protected financial identifiers were detected in this document."
+            )
+
+        # 7. Flattened Audit View using pd.json_normalize() (NO raw JSON)
+        with st.expander("🔍 Flattened Audit Log & Spatial Coordinates", expanded=False):
+            audit_records = []
+            for fname, finfo in extracted_fields.items():
+                c = finfo.get("confidence", {})
+                b = finfo.get("bbox")
+                bbox_str = f"Page {b.get('page', 1)} [{b.get('x')}, {b.get('y')}, {b.get('width')}x{b.get('height')}]" if b else "Unmapped"
+                audit_records.append({
+                    "Field Name": fname,
+                    "Value": finfo.get("value"),
+                    "Raw OCR Text": finfo.get("raw_ocr_text"),
+                    "Field Type": finfo.get("field_type"),
+                    "OCR Confidence": c.get("ocr_confidence"),
+                    "LLM Confidence": c.get("llm_confidence"),
+                    "Rule Passed": c.get("rule_check_passed"),
+                    "Combined Score": c.get("combined_score"),
+                    "Bucket": c.get("bucket"),
+                    "Source Bounding Box": bbox_str,
+                })
+            if audit_records:
+                st.dataframe(pd.json_normalize(audit_records), use_container_width=True, hide_index=True)
+
+        # 8. File Download Button for structured data (Internal data download without UI JSON dumps)
+        st.download_button(
+            label="📥 Download Extracted Intelligence Record (JSON)",
+            data=json.dumps(complete_pipeline_result, indent=2),
+            file_name=f"document_{doc_id[:8]}_intelligence_record.json",
+            mime="application/json",
+        )
 
     except Exception as e:
         st.error(f"❌ **Processing Error:** An unexpected error occurred: {str(e)}")
