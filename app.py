@@ -1,20 +1,27 @@
-"""Document Intelligence - Phases 1, 2 & 3: Ingestion, OCR & Authenticity/Deduplication.
+"""Document Intelligence - Phases 1, 2, 3 & 4.
 
 Streamlit application providing:
 - Phase 1: Ingestion, Metadata Extraction, Quality Assessment & Image Correction
-- Phase 3: Exact Hash & Perceptual Hash Duplicate Detection, Metadata Consistency, ELA Tamper Flags
-- Phase 2: Spatial Layout OCR via Tesseract, Visual Bounding Boxes, and Full Text Inspection
+- Phase 3: Exact Hash & Perceptual Hash Deduplication, Authenticity Pre-Checks (Metadata & ELA)
+- Phase 2: Spatial Layout OCR via Tesseract, Confidence-calibrated Bounding Boxes, Full Text
+- Phase 4: Schema-Driven Field & Table Extraction via Google Gemini, Spatial Grounding & DB Caching
 """
 
 from __future__ import annotations
 
 import json
+import os
+import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 
 import authenticity_check
 import db
+import extraction
 import ocr
 import preprocessing
+
+load_dotenv()
 
 # Page configuration
 st.set_page_config(
@@ -49,6 +56,17 @@ st.markdown(
         border-radius: 9999px;
         margin-bottom: 0.5rem;
     }
+    .doc-type-pill {
+        display: inline-block;
+        background-color: #0F172A;
+        color: #F8FAFC;
+        font-size: 1.1rem;
+        font-weight: 700;
+        padding: 0.35rem 1rem;
+        border-radius: 8px;
+        letter-spacing: 0.05em;
+        margin-bottom: 1rem;
+    }
     .legend-box {
         display: flex;
         gap: 1.5rem;
@@ -64,16 +82,36 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Sidebar with system controls & active pipelines
+# Sidebar with system controls & API configuration
 with st.sidebar:
-    st.markdown('<span class="phase-badge">Phase 1, 2 & 3 Active</span>', unsafe_allow_html=True)
+    st.markdown('<span class="phase-badge">Phases 1 - 4 Active</span>', unsafe_allow_html=True)
     st.title("System Controls")
+
+    # Google Gemini API Key
+    gemini_key_env = os.environ.get("GEMINI_API_KEY", "")
+
+    if gemini_key_env:
+        st.success("🟢 Google Gemini API: Active (.env)")
+    else:
+        st.warning("⚠️ No GEMINI_API_KEY detected in .env")
+
+    with st.expander("🔑 Gemini API Key Settings", expanded=not bool(gemini_key_env)):
+        gemini_input = st.text_input(
+            "Gemini API Key",
+            value=gemini_key_env,
+            type="password",
+            help="Used for Phase 4 field extraction via Google Gemini.",
+        )
+        if gemini_input:
+            os.environ["GEMINI_API_KEY"] = gemini_input.strip()
+
     st.markdown(
         """
-        **Pipeline Modules:**
+        **Active Pipelines:**
         - **Phase 1:** Ingestion, SHA-256 Hashing, EXIF/PDF Metadata, Blur & Skew Assessment, Deskewing, Bilateral Denoising.
-        - **Phase 3:** SHA-256 Exact Matching, pHash Similarity (Hamming dist <= 5), Timeline Inconsistency, Suspicious Software Checks, Error Level Analysis (ELA).
+        - **Phase 3:** Exact Hash & pHash Deduplication (Hamming dist <= 5), Timeline Inconsistency, Suspicious Software Checks, Error Level Analysis (ELA).
         - **Phase 2:** Tesseract OCR, Line Grouping, Spatial Bounding Boxes, Confidence Calibration.
+        - **Phase 4:** Google Gemini Document Classification, Schema-Driven Field Extraction, Table Extraction & Spatial Bbox Grounding.
         """
     )
     st.divider()
@@ -82,16 +120,16 @@ with st.sidebar:
     st.markdown(f"**Metadata Time Gap Threshold:** `{authenticity_check.METADATA_TIME_GAP_THRESHOLD_DAYS} day(s)`")
     st.divider()
     if ocr.TESSERACT_AVAILABLE:
-        st.success("Tesseract OCR Engine: Online")
+        st.success("Tesseract OCR: Online")
     else:
-        st.error("Tesseract OCR Engine: Offline (Check PATH or tesseract_cmd)")
-    st.caption("Document Intelligence Engine v3.0")
+        st.error("Tesseract OCR: Offline (Check PATH or tesseract_cmd)")
+    st.caption("Document Intelligence Engine v4.0")
 
 # Header Section
-st.markdown('<span class="phase-badge">Document Trust & Verification Layer</span>', unsafe_allow_html=True)
+st.markdown('<span class="phase-badge">Document Trust & Extraction Layer</span>', unsafe_allow_html=True)
 st.markdown('<div class="main-header">Document Intelligence System</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-header">Automated ingestion, deduplication, forensic authenticity pre-check, and layout OCR.</div>',
+    '<div class="sub-header">Automated ingestion, deduplication, authenticity pre-check, OCR layout, and schema-driven field extraction.</div>',
     unsafe_allow_html=True,
 )
 
@@ -236,28 +274,30 @@ if uploaded_file is not None:
             cached_result = db.get_cached_result(matched_id)
             if cached_result:
                 st.subheader("📦 Cached Pipeline Result")
+                if "doc_type" in cached_result:
+                    st.markdown(
+                        f'<div class="doc-type-pill">CACHED DOC TYPE: {cached_result["doc_type"].upper()}</div>',
+                        unsafe_allow_html=True,
+                    )
                 with st.expander("📄 Full Cached Result JSON", expanded=True):
                     st.json(cached_result)
 
-                # Show cached OCR text if available
-                cached_ocr = cached_result.get("ocr_results", {})
-                cached_pages = cached_ocr.get("pages", [])
-                if cached_pages:
-                    st.markdown("**Cached Extracted Text:**")
-                    for p in cached_pages:
-                        st.text_area(
-                            f"Cached Page {p.get('page_number')} Text",
-                            value=p.get("full_text", ""),
-                            height=200,
-                            key=f"cached_text_p_{p.get('page_number')}",
-                        )
+                # Show cached fields if present
+                if "extracted_fields" in cached_result:
+                    st.markdown("**Cached Extracted Fields:**")
+                    field_rows = [
+                        {"Field Name": k, "Extracted Value": v.get("value"), "Raw OCR Text": v.get("raw_ocr_text")}
+                        for k, v in cached_result["extracted_fields"].items()
+                    ]
+                    if field_rows:
+                        st.dataframe(pd.DataFrame(field_rows), use_container_width=True)
             else:
                 st.info(
                     f"A record for document `{matched_id}` is registered in the database. "
                     "Full downstream extraction has not yet been cached."
                 )
 
-            # Circuit breaker: Stop immediately, do not run Phase 2 OCR again
+            # Circuit breaker: Stop immediately, do not run Phase 2/4 again
             st.stop()
 
         # -------------------------------------------------------------
@@ -400,7 +440,94 @@ if uploaded_file is not None:
             if page_idx < len(pages_ocr) - 1:
                 st.divider()
 
-        # Update cache in SQLite with full pipeline results for future duplicate queries
+        # =============================================================
+        # Phase 4: Schema-Driven Field & Table Extraction
+        # =============================================================
+        st.divider()
+        st.subheader("🧠 Phase 4: Schema-Driven Field & Table Extraction")
+
+        # Execute extraction pipeline with clear error handling for Gemini
+        try:
+            with st.spinner("Phase 4: Classifying document type and extracting schema fields via Google Gemini..."):
+                extraction_result = extraction.run_extraction_pipeline(ocr_results)
+        except Exception as e:
+            st.error(f"🛑 **Extraction Failed — Could not reach Google Gemini service:** {str(e)}")
+            st.info(
+                "💡 Please verify that your `GEMINI_API_KEY` is configured in `.env` "
+                "or entered into the sidebar controls."
+            )
+            st.stop()
+
+        detected_doc_type = extraction_result["doc_type"]
+        extracted_fields = extraction_result.get("extracted_fields", {})
+        extracted_tables = extraction_result.get("tables", [])
+        skipped_fields = extraction_result.get("_skipped_fields", [])
+        unmapped_bbox_fields = extraction_result.get("_unmapped_bbox_fields", [])
+
+        # 1. Prominent Document Type Display
+        st.markdown(
+            f'<div class="doc-type-pill">DOCUMENT CLASSIFICATION: {detected_doc_type.upper()}</div>',
+            unsafe_allow_html=True,
+        )
+
+        # 2. Warnings for omitted / unfound fields
+        if skipped_fields:
+            st.warning(
+                f"⚠️ **Omitted / Unfound Fields:** The following fields from the `{detected_doc_type}` schema "
+                f"were not found in the document text (LLM returned null and they were excluded): "
+                f"{', '.join(f'`{f}`' for f in skipped_fields)}"
+            )
+
+        # 3. Warnings for fields without spatial bounding box
+        if unmapped_bbox_fields:
+            st.warning(
+                f"⚠️ **Spatial Grounding Warning:** Bounding boxes could not be located in OCR text for: "
+                f"{', '.join(f'`{f}`' for f in unmapped_bbox_fields)} (values exist but lack source region coordinates)."
+            )
+
+        # 4. Render Extracted Fields Table
+        st.markdown("#### 📌 Extracted Key-Value Fields")
+        if extracted_fields:
+            field_table_data = []
+            for fname, finfo in extracted_fields.items():
+                bbox = finfo.get("bbox")
+                if bbox:
+                    bbox_str = f"Page {bbox.get('page', 1)} [{bbox.get('x')}, {bbox.get('y')}, {bbox.get('width')}x{bbox.get('height')}]"
+                else:
+                    bbox_str = "⚠️ Not Located"
+
+                field_table_data.append({
+                    "Field Name": fname,
+                    "Extracted Value": finfo.get("value"),
+                    "Raw OCR Text": finfo.get("raw_ocr_text"),
+                    "Field Type": finfo.get("field_type"),
+                    "Source Bounding Box": bbox_str,
+                })
+            st.dataframe(pd.DataFrame(field_table_data), use_container_width=True)
+        else:
+            st.info("No key-value fields were extracted from this document.")
+
+        # 5. Render Tables (e.g. line_items, deductions, transactions)
+        if extracted_tables:
+            st.markdown("#### 📊 Extracted Tables")
+            for t in extracted_tables:
+                t_name = t.get("table_name", "table")
+                rows = t.get("rows", [])
+                st.markdown(f"**Table: `{t_name}`** ({len(rows)} rows)")
+
+                if rows:
+                    flattened_rows = []
+                    for r in rows:
+                        row_dict = {"Row #": r.get("row_index")}
+                        cells = r.get("cells", {})
+                        for col_name, c_data in cells.items():
+                            row_dict[col_name] = c_data.get("value")
+                        flattened_rows.append(row_dict)
+                    st.dataframe(pd.DataFrame(flattened_rows), use_container_width=True)
+                else:
+                    st.caption("Table structure was detected but contains no data rows.")
+
+        # 6. Update SQLite Cache with Complete Pipeline Results
         complete_pipeline_result = {
             "document_id": doc_id,
             "upload_timestamp": upload_ts,
@@ -408,22 +535,40 @@ if uploaded_file is not None:
             "quality_assessment": quality,
             "validation": validation_schema["validation"],
             "ocr_results": ocr_results,
+            "doc_type": detected_doc_type,
+            "extracted_fields": extracted_fields,
+            "tables": extracted_tables,
         }
-        db.update_cached_result(doc_id, complete_pipeline_result)
+        db.save_document_record(
+            document_id=doc_id,
+            file_hash=metadata["file_hash_sha256"],
+            perceptual_hash=perceptual_hash,
+            upload_timestamp=upload_ts,
+            result_json=complete_pipeline_result,
+            doc_type=detected_doc_type,
+        )
 
-        # Phase 2 JSON Schema Section
-        st.subheader("📑 Phase 2 & 3 Schema Output")
-        with st.expander("📄 Full Pipeline JSON Output", expanded=True):
-            st.json(complete_pipeline_result)
+        # 7. Phase 4 Output JSON Block
+        st.subheader("📑 Phase 4 Schema Output")
+        phase4_schema = {
+            "doc_type": detected_doc_type,
+            "extracted_fields": extracted_fields,
+            "tables": extracted_tables,
+        }
+        with st.expander("📄 Phase 4 Extracted Fields & Tables JSON Contract", expanded=True):
+            st.json(phase4_schema)
             st.download_button(
-                label="📥 Download Pipeline JSON",
-                data=json.dumps(complete_pipeline_result, indent=2),
-                file_name=f"document_{doc_id[:8]}_pipeline_results.json",
+                label="📥 Download Phase 4 JSON",
+                data=json.dumps(phase4_schema, indent=2),
+                file_name=f"document_{doc_id[:8]}_phase4_fields.json",
                 mime="application/json",
             )
+
+        with st.expander("📄 Cumulative Complete Pipeline JSON (Phases 1-4)", expanded=False):
+            st.json(complete_pipeline_result)
 
     except Exception as e:
         st.error(f"❌ **Processing Error:** An unexpected error occurred: {str(e)}")
         st.exception(e)
 else:
-    st.info("👆 Please upload a PDF, PNG, or JPG document above to begin Ingestion, Verification, and OCR layout extraction.")
+    st.info("👆 Please upload a PDF, PNG, or JPG document above to begin Ingestion, Verification, OCR, and Field Extraction.")
