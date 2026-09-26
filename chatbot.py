@@ -84,7 +84,9 @@ def build_context_for_query(documents: list[dict[str, Any]], query: str = "") ->
         upload_ts = doc.get("upload_timestamp", "")
         date_str = upload_ts[:10] if len(upload_ts) >= 10 else upload_ts
 
-        lines = [f"Document [{doc_type}, uploaded {date_str}, ID: {doc_id}]:"]
+        meta = doc.get("file_metadata", {})
+        fname = meta.get("original_filename") or f"{doc_type}_{doc_id[:8]}"
+        lines = [f"Document [filename: {fname}, type: {doc_type}, uploaded {date_str}, ID: {doc_id}]:"]
 
         # 1. Extracted Fields
         fields = doc.get("extracted_fields", {})
@@ -115,19 +117,14 @@ def build_context_for_query(documents: list[dict[str, Any]], query: str = "") ->
                 tname = tbl.get("table_name", "table")
                 rows = tbl.get("rows", [])
                 lines.append(f"- {tname} table: {len(rows)} rows")
-
-                # If query asks about line items/transactions/rows, include brief row summaries
-                wants_table_details = any(
-                    kw in q_lower
-                    for kw in ("item", "table", "line", "row", "quantity", "price", "description", "transaction")
-                )
-                if wants_table_details and rows:
-                    for r_idx, r in enumerate(rows[:5]):
-                        cells = r.get("cells", {})
-                        cell_desc = []
-                        for col_name, c_data in cells.items():
-                            c_val = c_data.get("value") if isinstance(c_data, dict) else c_data
+                for r_idx, r in enumerate(rows[:10]):
+                    cells = r.get("cells", {})
+                    cell_desc = []
+                    for col_name, c_data in cells.items():
+                        c_val = c_data.get("value") if isinstance(c_data, dict) else c_data
+                        if c_val is not None:
                             cell_desc.append(f"{col_name}: {c_val}")
+                    if cell_desc:
                         lines.append(f"  * row {r_idx + 1}: {', '.join(cell_desc)}")
 
         # 3. Validation Summary
