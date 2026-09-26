@@ -45,10 +45,43 @@ def init_db(db_path: str = DB_PATH) -> None:
                 """
             )
             cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    detail TEXT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS corrections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id TEXT NOT NULL,
+                    doc_type TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    original_value TEXT,
+                    corrected_value TEXT NOT NULL,
+                    corrected_by TEXT NOT NULL,
+                    corrected_at TEXT NOT NULL,
+                    ocr_context_snippet TEXT
+                )
+                """
+            )
+            cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_file_hash ON documents (file_hash_sha256)"
             )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_perceptual_hash ON documents (perceptual_hash)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_log_doc_id ON audit_log (document_id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_corrections_doc_type ON corrections (doc_type, field_name)"
             )
             conn.commit()
     except Exception as e:

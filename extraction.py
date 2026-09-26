@@ -675,3 +675,200 @@ def run_extraction_pipeline(
 
     doc_type = classify_doc_type(ocr_full_text, client=client)
     return extract_fields(ocr_results, doc_type=doc_type, client=client)
+
+
+# ==============================================================================
+# Phase 8: Correction Memory & Adaptive Extraction
+# ==============================================================================
+
+def build_extraction_prompt_with_memory(doc_type: str, ocr_full_text: str) -> str:
+    """Construct an extraction prompt augmented with few-shot reviewer correction memory.
+
+    Args:
+        doc_type: Document classification category.
+        ocr_full_text: OCR text across all pages.
+
+    Returns:
+        Augmented prompt string if corrections exist, or unchanged base prompt.
+    """
+    import corrections
+
+    base_prompt = build_extraction_prompt(doc_type, ocr_full_text)
+    fewshot_block = corrections.build_fewshot_examples_block(doc_type)
+
+    if not fewshot_block:
+        return base_prompt
+
+    memory_section = (
+        f"\n\n### Prior correction feedback:\n"
+        f"{fewshot_block}\n\n"
+    )
+
+    if "### STRICT INSTRUCTIONS:" in base_prompt:
+        return base_prompt.replace(
+            "### STRICT INSTRUCTIONS:",
+            f"{memory_section}### STRICT INSTRUCTIONS:",
+            1,
+        )
+
+    return base_prompt + memory_section
+
+
+def extract_fields_with_memory(
+    ocr_results: dict[str, Any],
+    doc_type: str,
+    client: Any = None,
+) -> dict[str, Any]:
+    """Extract fields using memory-augmented prompt and map coordinates.
+
+    Args:
+        ocr_results: Phase 2 ocr_results dict.
+        doc_type: Document classification label.
+        client: Optional preconfigured Gemini client.
+
+    Returns:
+        Dict matching Phase 4 schema contract.
+    """
+    pages = ocr_results.get("pages", [])
+    ocr_full_text = "\n\n".join(
+        f"--- Page {p.get('page_number', i + 1)} ---\n{p.get('full_text', '')}"
+        for i, p in enumerate(pages)
+    )
+
+    prompt = build_extraction_prompt_with_memory(doc_type, ocr_full_text)
+
+    # Console print showing the final prompt sent to LLM for visual confirmation
+    print("\n" + "=" * 60)
+    print(f"[DEBUG extraction with memory] FINAL EXTRACTION PROMPT SENT TO LLM ({doc_type}):")
+    print(prompt)
+    print("=" * 60 + "\n")
+
+    raw_extraction = call_llm_for_extraction(prompt, client=client)
+
+    raw_fields = raw_extraction.get("fields", {})
+    raw_tables = raw_extraction.get("tables", [])
+
+    schema_config = DOC_TYPE_SCHEMAS.get(doc_type, DOC_TYPE_SCHEMAS["other"])
+    expected_field_types = schema_config.get("fields", {})
+
+    extracted_fields: dict[str, Any] = {}
+    skipped_fields: list[str] = []
+    unmapped_bbox_fields: list[str] = []
+
+    for field_name, value in raw_fields.items():
+        if value is None or str(value).strip().lower() in ("null", "none", ""):
+            skipped_fields.append(field_name)
+            continue
+
+        field_type = expected_field_types.get(field_name) or _infer_field_type(field_name, value)
+        bbox_info = map_value_to_bbox(value, ocr_results)
+
+        if bbox_info and bbox_info.get("bbox"):
+            raw_text = bbox_info["raw_ocr_text"]
+            bbox = bbox_info["bbox"]
+        else:
+            raw_text = str(value)
+            bbox = None
+            unmapped_bbox_fields.append(field_name)
+
+        extracted_fields[field_name] = {
+            "value": value,
+            "raw_ocr_text": raw_text,
+            "bbox": bbox,
+            "field_type": field_type,
+        }
+
+    # Format tables conforming to schema
+    tables_output: list[dict[str, Any]] = []
+    for table_idx, t in enumerate(raw_tables):
+        t_name = t.get("table_name", f"table_{table_idx + 1}")
+        raw_rows = t.get("rows", [])
+        formatted_rows: list[dict[str, Any]] = []
+
+        table_page = 1
+        all_cell_bboxes: list[dict[str, int]] = []
+
+        for r_idx, r_dict in enumerate(raw_rows):
+            cells_dict: dict[str, Any] = {}
+            for col_name, cell_val in r_dict.items():
+                if cell_val is None:
+                    continue
+                cell_bbox_info = map_value_to_bbox(cell_val, ocr_results)
+                if cell_bbox_info and cell_bbox_info.get("bbox"):
+                    c_bbox = cell_bbox_info["bbox"]
+                    table_page = c_bbox.get("page", 1)
+                    clean_cell_bbox = {
+                        "x": c_bbox["x"],
+                        "y": c_bbox["y"],
+                        "width": c_bbox["width"],
+                        "height": c_bbox["height"],
+                    }
+                    all_cell_bboxes.append(clean_cell_bbox)
+                else:
+                    clean_cell_bbox = None
+
+                cells_dict[col_name] = {
+                    "value": cell_val,
+                    "bbox": clean_cell_bbox,
+                }
+
+            formatted_rows.append({
+                "row_index": r_idx + 1,
+                "cells": cells_dict,
+            })
+
+        if all_cell_bboxes:
+            t_min_x = min(b["x"] for b in all_cell_bboxes)
+            t_min_y = min(b["y"] for b in all_cell_bboxes)
+            t_max_x = max(b["x"] + b["width"] for b in all_cell_bboxes)
+            t_max_y = max(b["y"] + b["height"] for b in all_cell_bboxes)
+            table_bbox = {
+                "page": table_page,
+                "x": t_min_x,
+                "y": t_min_y,
+                "width": t_max_x - t_min_x,
+                "height": t_max_y - t_min_y,
+            }
+        else:
+            table_bbox = None
+
+        tables_output.append({
+            "table_name": t_name,
+            "bbox": table_bbox,
+            "rows": formatted_rows,
+        })
+
+    return {
+        "doc_type": doc_type,
+        "extracted_fields": extracted_fields,
+        "tables": tables_output,
+        "_skipped_fields": skipped_fields,
+        "_unmapped_bbox_fields": unmapped_bbox_fields,
+    }
+
+
+def run_extraction_pipeline_with_memory(
+    ocr_results: dict[str, Any],
+    client: Any = None,
+) -> dict[str, Any]:
+    """Execute classification and schema-driven field extraction with correction memory.
+
+    Args:
+        ocr_results: Output of Phase 2 run_ocr_on_document.
+        client: Optional preconfigured Gemini client.
+
+    Returns:
+        Dict matching Phase 4 schema contract.
+    """
+    if client is None:
+        client = get_gemini_client()
+
+    pages = ocr_results.get("pages", [])
+    ocr_full_text = "\n\n".join(
+        f"--- Page {p.get('page_number', i + 1)} ---\n{p.get('full_text', '')}"
+        for i, p in enumerate(pages)
+    )
+
+    doc_type = classify_doc_type(ocr_full_text, client=client)
+    return extract_fields_with_memory(ocr_results, doc_type=doc_type, client=client)
+
